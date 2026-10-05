@@ -39,6 +39,15 @@ from .store.jsonfile import JsonStore
 from .temp.temp import TempControl
 from .telemetry import TrendBuffer
 from .quota.quota import QuotaLedger
+from .schedule.model import Request
+from .schedule.roster import roster_from_platform
+from .schedule.scheduler import Scheduler
+from .schedule.constraints import (
+    CurtailmentInterval,
+    CurtailmentPlan,
+    MaintenancePlan,
+    MaintenanceWindow,
+)
 
 DEFAULT_STATION = "station1"
 DEFAULT_RACK = "rk-01"
@@ -106,6 +115,7 @@ class Platform:
         self.soc = SocEstimator(self.config.soc, self.bms.calibration)
         self.balancer = Balancer(self.config.balance)
         self.quota = QuotaLedger(self.config.quota)
+        self.scheduler = self._build_scheduler()
 
         self._cycles = 0
         self._operations = 0
@@ -117,6 +127,22 @@ class Platform:
         self._register_namespaces()
         self._restore()
         self.bms.calibration.record(self.config.soc.initial_soc_pct, self.clock.now(), "startup")
+
+    def _build_scheduler(self) -> Scheduler:
+        """按真实簇、并网点限额与配额额度装配排程服务。"""
+
+        roster = roster_from_platform(self, reserve_soc_pct=20.0)
+        grid_cfg = self.config.grid
+        quota_cfg = self.config.quota
+        return Scheduler(
+            roster,
+            storage=self.store,
+            quota_period_hours=quota_cfg.period_hours,
+            charge_quota_kwh=quota_cfg.charge_quota_kwh,
+            discharge_quota_kwh=quota_cfg.discharge_quota_kwh,
+            default_export_kw=grid_cfg.export_limit_kw,
+            default_import_kw=grid_cfg.import_limit_kw,
+        )
 
     def _register_namespaces(self) -> None:
         """登记现场设备命名空间（控制台与审计共用同一套名字）。"""
@@ -130,6 +156,7 @@ class Platform:
             ("station", "soc", "state-of-charge"),
             ("station", "balance", "cell-balancer"),
             ("station", "quota", "quota-ledger"),
+            ("station", "schedule", "schedule-planner"),
             ("station", "audit", "run-audit"),
         ):
             self.namespaces.register(area, device, kind)
@@ -740,6 +767,190 @@ class Platform:
     def audit_snapshot(self) -> dict:
         return self.audit.snapshot().as_dict()
 
+    @staticmethod
+    def _maintenance_plan(entries: list[dict] | None) -> MaintenancePlan:
+        """把检修计划入参（字典）构造成不可用窗口。"""
+
+        windows = [
+            MaintenanceWindow(
+                rack_id=str(item["rack_id"]),
+                start=float(item["start"]),
+                end=float(item["end"]),
+                reason=str(item.get("reason", "")),
+            )
+            for item in (entries or [])
+        ]
+        return MaintenancePlan(windows)
+
+    def _curtailment_plan(self, entries: list[dict] | None) -> CurtailmentPlan:
+        """把限电区间入参构造成限电曲线，缺省回落并网点铭牌限额。"""
+
+        intervals = [
+            CurtailmentInterval(
+                start=float(item["start"]),
+                end=float(item["end"]),
+                export_limit_kw=float(item.get("export_limit_kw", self.config.grid.export_limit_kw)),
+                import_limit_kw=float(item.get("import_limit_kw", self.config.grid.import_limit_kw)),
+            )
+            for item in (entries or [])
+        ]
+        return CurtailmentPlan(
+            intervals,
+            default_export_kw=self.config.grid.export_limit_kw,
+            default_import_kw=self.config.grid.import_limit_kw,
+        )
+
+    @staticmethod
+    def _requests(raw_requests: list[dict] | None) -> list[Request]:
+        """把排程申请入参构造成领域申请。"""
+
+        built: list[Request] = []
+        for item in raw_requests or []:
+            built.append(
+                Request(
+                    request_id=str(item["request_id"]),
+                    action=str(item["action"]),
+                    energy_kwh=float(item["energy_kwh"]),
+                    submitted_at=float(item["submitted_at"]),
+                    window_start=float(item["window_start"]),
+                    window_end=float(item["window_end"]),
+                    rack_id=item.get("rack_id"),
+                    party=str(item.get("party", "")),
+                    flexible=bool(item.get("flexible", True)),
+                )
+            )
+        return built
+
+    def generate_schedule(
+        self,
+        *,
+        day_start: float,
+        requests: list[dict] | None = None,
+        slot_s: float = 3600.0,
+        maintenance: list[dict] | None = None,
+        curtailment: list[dict] | None = None,
+        auto_charge: bool = True,
+        auto_discharge: bool = True,
+        reserve_soc_pct: float = 20.0,
+        policy: str | None = None,
+        note: str = "",
+    ) -> dict:
+        """生成日前可执行排程：排不上的带原因，排完即与三处台账对账。"""
+
+        with self._lock:
+            if policy is not None:
+                self.scheduler.set_policy(policy)
+            self._refresh_scheduler_reserve(reserve_soc_pct)
+            snapshot = self.scheduler.generate_day_ahead(
+                day_start=day_start,
+                requests=self._requests(requests),
+                slot_s=slot_s,
+                maintenance=self._maintenance_plan(maintenance),
+                curtailment=self._curtailment_plan(curtailment),
+                recorded_at=self.clock.now(),
+                auto_charge=auto_charge,
+                auto_discharge=auto_discharge,
+                auto_target_soc_pct=self.config.rack.soc_max_pct,
+                note=note,
+            )
+            payload = snapshot.as_dict()
+            self._publish_schedule_event(payload)
+            return payload
+
+    def revise_schedule(
+        self,
+        *,
+        start: float,
+        end: float,
+        requests: list[dict] | None = None,
+        slot_s: float = 3600.0,
+        maintenance: list[dict] | None = None,
+        curtailment: list[dict] | None = None,
+        auto_charge: bool = False,
+        auto_discharge: bool = False,
+        reserve_soc_pct: float = 20.0,
+        policy: str | None = None,
+        note: str = "",
+    ) -> dict:
+        """按新申请或新约束重算区间，落一个修订版本（旧版可回放）。"""
+
+        with self._lock:
+            if policy is not None:
+                self.scheduler.set_policy(policy)
+            self._refresh_scheduler_reserve(reserve_soc_pct)
+            snapshot = self.scheduler.revise(
+                start=start,
+                end=end,
+                requests=self._requests(requests),
+                slot_s=slot_s,
+                maintenance=self._maintenance_plan(maintenance),
+                curtailment=self._curtailment_plan(curtailment),
+                recorded_at=self.clock.now(),
+                auto_charge=auto_charge,
+                auto_discharge=auto_discharge,
+                auto_target_soc_pct=self.config.rack.soc_max_pct,
+                note=note,
+            )
+            payload = snapshot.as_dict()
+            self._publish_schedule_event(payload, action="schedule_revised")
+            return payload
+
+    def _refresh_scheduler_reserve(self, reserve_soc_pct: float) -> None:
+        """用实时 SOC 与最新保留线重建名册，让排程读到当前簇状态。"""
+
+        roster = roster_from_platform(self, reserve_soc_pct=reserve_soc_pct)
+        self.scheduler.replace_roster(roster)
+
+    def _publish_schedule_event(self, payload: dict, action: str = "schedule_generated") -> None:
+        self.bus.publish(
+            Event.of(
+                "schedule",
+                "schedule",
+                action,
+                station=self.station,
+                severity="notice",
+                plan_id=payload["plan_id"],
+                version=payload["version"],
+                allocations=payload["counts"]["allocations"],
+                rejections=payload["counts"]["rejections"],
+                reconciled=payload["counts"]["reconciled"],
+            )
+        )
+
+    def schedule_latest(self) -> dict | None:
+        with self._lock:
+            return self.scheduler.latest()
+
+    def schedule_versions(self) -> dict:
+        with self._lock:
+            return {"versions": self.scheduler.versions_index()}
+
+    def schedule_replay(self, *, version: int | None = None, effective_ts: float | None = None, recorded_ts: float | None = None) -> dict:
+        """按版本号／生效时刻／记录时刻回放历史排程。"""
+
+        with self._lock:
+            if version is not None:
+                payload = self.scheduler.replay_version(version)
+                return {"mode": "version", "version": version, "plan": payload}
+            if effective_ts is not None:
+                payload = self.scheduler.replay_effective(effective_ts)
+                return {"mode": "effective", "ts": effective_ts, "plan": payload}
+            if recorded_ts is not None:
+                payload = self.scheduler.replay_recorded(recorded_ts)
+                return {"mode": "recorded", "ts": recorded_ts, "plans": payload}
+            return {"modes": ["version", "effective", "recorded"]}
+
+    def schedule_snapshot(self) -> dict:
+        """返回排程层当前状态：名册、归属策略、最新计划与版本索引。"""
+
+        with self._lock:
+            return {
+                "roster": self.scheduler.roster.as_dict(),
+                "policy": self.scheduler.policy,
+                "latest": self.scheduler.latest(),
+                "versions": self.scheduler.versions_index(),
+            }
+
     def trend_snapshot(self) -> dict:
         return self.trend.snapshot()
 
@@ -776,6 +987,7 @@ class Platform:
             "status": self.status(),
             "capacity": self.capacity().as_dict(),
             "quota": self.quota_snapshot(),
+            "schedule": self.schedule_snapshot(),
             "audit": self.audit_snapshot(),
             "mapping": self.rack_mapping(),
             "config": config_to_mapping(self.config),

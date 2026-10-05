@@ -1,10 +1,12 @@
 """命令行入口。
 
-六个子命令覆盖日常使用：
+七个子命令覆盖日常使用：
 
 ``serve``    启动控制台 HTTP 服务，可选地在启动后探测接口；
 ``demo``     在本地跑一遍完整流程（启动 → 并网切换 → 温度降额 → 均衡 → 充电 →
              放电 → 消防联动 → 复位 → 并发探测），用于交付前的真实运行检查；
+``schedule`` 按峰谷窗口对两百多簇生成一份可执行排程（谷充峰放、保留调峰、
+             与检修／限电／额度对账），用于排程层的离线核对；
 ``status``   打印当前状态快照；
 ``config``   打印生效配置；
 ``alerts``   打印按最新编号路由后的告警；
@@ -16,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
 import time
 
 from .app import Platform, build_platform
@@ -23,6 +26,12 @@ from .clock import ManualClock, SystemClock
 from .config import config_to_mapping, default_config, load_config
 from .console.server import ConsoleServer, probe_endpoints
 from .errors import StoreError
+from .schedule.constraints import CurtailmentInterval, CurtailmentPlan, MaintenancePlan, MaintenanceWindow
+from .schedule.model import Request
+from .schedule.roster import synthetic_roster
+from .schedule.scheduler import Scheduler
+from .schedule.windows import midnight_of
+from .store.jsonfile import JsonStore
 
 DEFAULT_PROBE_PATHS = ("/api/status", "/api/readiness", "/api/topology", "/api/audit", "/api/racks")
 
@@ -171,6 +180,65 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_schedule(args: argparse.Namespace) -> int:
+    """对合成的多簇名册生成日前排程，打印可执行计划与对账结果。"""
+
+    clock = ManualClock()
+    day = midnight_of(clock.now())
+    store = JsonStore(args.storage_root or tempfile.mkdtemp(prefix="schedule-"))
+    roster = synthetic_roster(
+        args.clusters,
+        rated_kwh=args.rated_kwh,
+        initial_soc_pct=args.soc_pct,
+        reserve_soc_pct=args.reserve_soc_pct,
+        max_charge_kw=args.max_charge_kw,
+        max_discharge_kw=args.max_discharge_kw,
+    )
+    scheduler = Scheduler(
+        roster,
+        storage=store,
+        charge_quota_kwh=args.charge_quota_kwh,
+        discharge_quota_kwh=args.discharge_quota_kwh,
+        default_export_kw=args.export_limit_kw,
+        default_import_kw=args.import_limit_kw,
+        policy=args.policy,
+    )
+    maintenance = MaintenancePlan(
+        [MaintenanceWindow(f"rk-{index:03d}", day + 8 * 3600, day + 12 * 3600, "计划检修") for index in range(1, args.maintenance + 1)]
+    )
+    curtailment = CurtailmentPlan(
+        [CurtailmentInterval(day + 18 * 3600, day + 20 * 3600, args.export_limit_kw * 0.5, args.import_limit_kw * 0.6)],
+        default_export_kw=args.export_limit_kw,
+        default_import_kw=args.import_limit_kw,
+    )
+    requests = [
+        Request(
+            f"team-{index}",
+            "discharge",
+            args.request_kwh,
+            submitted_at=day + (index % 7) * 60.0,
+            window_start=day + 8 * 3600,
+            window_end=day + 20 * 3600,
+            rack_id=f"rk-{(index % args.clusters) + 1:03d}",
+            party=f"班组{index % 4}",
+        )
+        for index in range(args.requests)
+    ]
+    snapshot = scheduler.generate_day_ahead(
+        day_start=day,
+        requests=requests,
+        slot_s=args.slot_s,
+        maintenance=maintenance,
+        curtailment=curtailment,
+        recorded_at=day - 3600,
+        auto_charge=not args.no_house,
+        auto_discharge=not args.no_house,
+        note="CLI 日前排程",
+    )
+    _dump(snapshot.as_dict())
+    return 0 if snapshot.counts["reconciled"] else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -212,6 +280,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    schedule = sub.add_parser("schedule", help="对多簇生成峰谷日前排程", parents=[common])
+    schedule.add_argument("--clusters", type=int, default=220, help="簇数量")
+    schedule.add_argument("--rated-kwh", type=float, default=500.0, help="单簇额定电量")
+    schedule.add_argument("--soc-pct", type=float, default=55.0, help="初始 SOC")
+    schedule.add_argument("--reserve-soc-pct", type=float, default=20.0, help="临时调峰保留 SOC")
+    schedule.add_argument("--max-charge-kw", type=float, default=500.0)
+    schedule.add_argument("--max-discharge-kw", type=float, default=400.0)
+    schedule.add_argument("--export-limit-kw", type=float, default=60000.0, help="全站上网限额")
+    schedule.add_argument("--import-limit-kw", type=float, default=80000.0, help="全站用电限额")
+    schedule.add_argument("--charge-quota-kwh", type=float, default=60000.0)
+    schedule.add_argument("--discharge-quota-kwh", type=float, default=60000.0)
+    schedule.add_argument("--requests", type=int, default=60, help="抢簇申请条数")
+    schedule.add_argument("--request-kwh", type=float, default=120.0)
+    schedule.add_argument("--maintenance", type=int, default=10, help="当天检修簇数")
+    schedule.add_argument("--slot-s", type=float, default=3600.0)
+    schedule.add_argument("--policy", choices=("effective", "submit"), default="effective")
+    schedule.add_argument("--no-house", action="store_true", help="关闭站内谷充峰放套利")
+    schedule.set_defaults(func=_cmd_schedule)
     return parser
 
 

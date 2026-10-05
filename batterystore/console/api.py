@@ -67,6 +67,12 @@ class Api:
         add("GET", "/api/soc", lambda params, body: self._platform.soc_snapshot())
         add("GET", "/api/balance", lambda params, body: self._platform.balance_snapshot())
         add("GET", "/api/quota", lambda params, body: self._platform.quota_snapshot())
+        add("GET", "/api/schedule", lambda params, body: self._platform.schedule_snapshot())
+        add("GET", "/api/schedule/latest", lambda params, body: self._platform.schedule_latest())
+        add("GET", "/api/schedule/versions", lambda params, body: self._platform.schedule_versions())
+        add("GET", "/api/schedule/replay", self._schedule_replay)
+        add("POST", "/api/schedule/generate", self._schedule_generate)
+        add("POST", "/api/schedule/revise", self._schedule_revise)
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/audit/report", lambda params, body: self._platform.audit.report())
         add("GET", "/api/audit/operations", self._operations)
@@ -261,3 +267,42 @@ class Api:
 
     def _probe_fault(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_fault_probe(rounds=_as_int(body, "rounds", 16))
+
+    def _schedule_generate(self, params: dict, body: dict) -> dict:
+        return self._platform.generate_schedule(
+            day_start=_as_float(body, "day_start", float(self._platform.clock.now())),
+            requests=body.get("requests"),
+            slot_s=_as_float(body, "slot_s", 3600.0),
+            maintenance=body.get("maintenance"),
+            curtailment=body.get("curtailment"),
+            auto_charge=bool(body.get("auto_charge", True)),
+            auto_discharge=bool(body.get("auto_discharge", True)),
+            reserve_soc_pct=_as_float(body, "reserve_soc_pct", 20.0),
+            policy=body.get("policy"),
+            note=str(body.get("note", "")),
+        )
+
+    def _schedule_revise(self, params: dict, body: dict) -> dict:
+        return self._platform.revise_schedule(
+            start=_as_float(body, "start", float(self._platform.clock.now())),
+            end=_as_float(body, "end", float(self._platform.clock.now()) + 86400.0),
+            requests=body.get("requests"),
+            slot_s=_as_float(body, "slot_s", 3600.0),
+            maintenance=body.get("maintenance"),
+            curtailment=body.get("curtailment"),
+            auto_charge=bool(body.get("auto_charge", False)),
+            auto_discharge=bool(body.get("auto_discharge", False)),
+            reserve_soc_pct=_as_float(body, "reserve_soc_pct", 20.0),
+            policy=body.get("policy"),
+            note=str(body.get("note", "")),
+        )
+
+    def _schedule_replay(self, params: dict, body: dict) -> dict:
+        version = params.get("version")
+        effective_ts = params.get("effective_ts")
+        recorded_ts = params.get("recorded_ts")
+        return self._platform.schedule_replay(
+            version=int(version) if version is not None else None,
+            effective_ts=float(effective_ts) if effective_ts is not None else None,
+            recorded_ts=float(recorded_ts) if recorded_ts is not None else None,
+        )
