@@ -39,6 +39,8 @@ from .store.jsonfile import JsonStore
 from .temp.temp import TempControl
 from .telemetry import TrendBuffer
 from .quota.quota import QuotaLedger
+from .schedule.context import build_curtailment, build_quota_budget
+from .schedule.service import Scheduler
 
 DEFAULT_STATION = "station1"
 DEFAULT_RACK = "rk-01"
@@ -106,6 +108,13 @@ class Platform:
         self.soc = SocEstimator(self.config.soc, self.bms.calibration)
         self.balancer = Balancer(self.config.balance)
         self.quota = QuotaLedger(self.config.quota)
+        self.scheduler = Scheduler(
+            self.clock,
+            self.store,
+            self.bus,
+            self._schedule_context,
+            tariff_kind=self.quota.tariff.kind,
+        )
 
         self._cycles = 0
         self._operations = 0
@@ -130,6 +139,7 @@ class Platform:
             ("station", "soc", "state-of-charge"),
             ("station", "balance", "cell-balancer"),
             ("station", "quota", "quota-ledger"),
+            ("station", "schedule", "schedule-planner"),
             ("station", "audit", "run-audit"),
         ):
             self.namespaces.register(area, device, kind)
@@ -736,6 +746,122 @@ class Platform:
 
     def quota_snapshot(self) -> dict:
         return self.quota.snapshot(self.clock.now()).as_dict()
+
+    def _schedule_context(self) -> tuple:
+        """在排程当口从真实组件取现场快照（配置、簇、故障、额度、限电基线）。"""
+
+        now = self.clock.now()
+        fault_ids = {rack_id for rack_id in self.racks if self.bms.latch.held(rack_id, now)}
+        return (
+            self.config,
+            self.racks,
+            fault_ids,
+            build_quota_budget(self.quota, now),
+            build_curtailment(self.grid),
+        )
+
+    def submit_schedule_bid(
+        self,
+        bid_id: str,
+        direction: str,
+        energy_kwh: float,
+        *,
+        effective_at: float | None = None,
+        power_kw: float | None = None,
+        owner: str = "",
+        note: str = "",
+    ) -> dict:
+        """提交一条充／放申请单。"""
+
+        with self._lock:
+            return self.scheduler.submit_bid(
+                bid_id,
+                direction,
+                energy_kwh,
+                effective_at=effective_at,
+                power_kw=power_kw,
+                owner=owner,
+                note=note,
+            )
+
+    def add_maintenance_window(self, rack_id: str, start: float, end: float, reason: str = "") -> dict:
+        """登记一簇的检修区间，排程与对账都绕开它。"""
+
+        with self._lock:
+            return self.scheduler.add_maintenance(rack_id, start, end, reason)
+
+    def set_curtailment(self, slot_index: int, *, import_kw: float | None = None, export_kw: float | None = None) -> dict:
+        """对某时段设置临时限电（千瓦）。"""
+
+        with self._lock:
+            return self.scheduler.set_curtailment(slot_index, import_kw=import_kw, export_kw=export_kw)
+
+    def set_reserve(self, **kwargs: float) -> dict:
+        """设置临时调峰余量策略。"""
+
+        with self._lock:
+            return self.scheduler.set_reserve(**kwargs)
+
+    def schedule_inputs(self) -> dict:
+        """返回当前排程输入台账。"""
+
+        with self._lock:
+            return self.scheduler.inputs()
+
+    def explain_schedule_policy(self, plan_date: str) -> dict:
+        """说明两种冲突归属口径在该运营日跨零点窗口上的差异。"""
+
+        with self._lock:
+            return self.scheduler.explain_policy(plan_date)
+
+    def clock_iso_date(self) -> str:
+        """返回当前挂钟对应的 UTC 运营日。"""
+
+        import time
+
+        return time.strftime("%Y-%m-%d", time.gmtime(self.clock.now()))
+
+    def generate_schedule(self, plan_date: str | None = None, *, policy: str | None = None, reason: str = "") -> dict:
+        """为运营日出一版可执行方案，并完成三处对账与版本落盘。"""
+
+        with self._lock:
+            return self.scheduler.generate(plan_date, policy=policy, reason=reason)
+
+    def current_schedule(self) -> dict | None:
+        """读取当前版本方案。"""
+
+        with self._lock:
+            return self.scheduler.current_schedule()
+
+    def schedule_version(self, plan_date: str, version: int) -> dict | None:
+        """读取某运营日某一历史版本方案。"""
+
+        with self._lock:
+            return self.scheduler.get_version(plan_date, version)
+
+    def replay_schedule(self, plan_date: str) -> list[dict]:
+        """按版本升序回放某运营日的全部方案。"""
+
+        with self._lock:
+            return self.scheduler.replay_day(plan_date)
+
+    def schedule_versions(self) -> list[dict]:
+        """跨运营日按时间回放全部版本头。"""
+
+        with self._lock:
+            return self.scheduler.replay_all_versions()
+
+    def recompute_schedule(self, plan_date: str, version: int) -> dict:
+        """用某版落盘输入重算，核对与存档结果一致。"""
+
+        with self._lock:
+            return self.scheduler.recompute(plan_date, version)
+
+    def clear_schedule_bids(self) -> int:
+        """清空排程申请单。"""
+
+        with self._lock:
+            return self.scheduler.clear_bids()
 
     def audit_snapshot(self) -> dict:
         return self.audit.snapshot().as_dict()

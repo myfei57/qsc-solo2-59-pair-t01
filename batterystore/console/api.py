@@ -30,6 +30,12 @@ def _as_int(body: dict, key: str, default: int) -> int:
         raise StoreError(f"参数 {key!r} 必须是整数", component="console") from error
 
 
+def _as_optional_float(body: dict, key: str) -> float | None:
+    if key not in body or body.get(key) is None:
+        return None
+    return _as_float(body, key, 0.0)
+
+
 class Api:
     """把 HTTP 请求翻译成平台调用。"""
 
@@ -67,6 +73,13 @@ class Api:
         add("GET", "/api/soc", lambda params, body: self._platform.soc_snapshot())
         add("GET", "/api/balance", lambda params, body: self._platform.balance_snapshot())
         add("GET", "/api/quota", lambda params, body: self._platform.quota_snapshot())
+        add("GET", "/api/schedule", lambda params, body: self._platform.current_schedule())
+        add("GET", "/api/schedule/inputs", lambda params, body: self._platform.schedule_inputs())
+        add("GET", "/api/schedule/policy", self._schedule_policy)
+        add("GET", "/api/schedule/versions", lambda params, body: {"versions": self._platform.schedule_versions()})
+        add("GET", "/api/schedule/version", self._schedule_version)
+        add("GET", "/api/schedule/replay", self._schedule_replay)
+        add("GET", "/api/schedule/recompute", self._schedule_recompute)
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/audit/report", lambda params, body: self._platform.audit.report())
         add("GET", "/api/audit/operations", self._operations)
@@ -100,6 +113,12 @@ class Api:
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/probe/pcs", self._probe_pcs)
         add("POST", "/api/probe/fault", self._probe_fault)
+        add("POST", "/api/schedule/bid", self._schedule_bid)
+        add("POST", "/api/schedule/maintenance", self._schedule_maintenance)
+        add("POST", "/api/schedule/curtailment", self._schedule_curtailment)
+        add("POST", "/api/schedule/reserve", self._schedule_reserve)
+        add("POST", "/api/schedule/generate", self._schedule_generate)
+        add("POST", "/api/schedule/clear-bids", lambda params, body: {"cleared": self._platform.clear_schedule_bids()})
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
@@ -261,3 +280,70 @@ class Api:
 
     def _probe_fault(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_fault_probe(rounds=_as_int(body, "rounds", 16))
+
+    def _schedule_bid(self, params: dict, body: dict) -> dict:
+        bid_id = str(body.get("bid_id", "")).strip()
+        if not bid_id:
+            raise StoreError("bid_id 不能为空", component="console")
+        direction = str(body.get("direction", ""))
+        if direction not in ("charge", "discharge"):
+            raise StoreError("direction 必须是 charge 或 discharge", component="console")
+        return self._platform.submit_schedule_bid(
+            bid_id,
+            direction,
+            _as_float(body, "energy_kwh", 0.0),
+            effective_at=_as_optional_float(body, "effective_at"),
+            power_kw=_as_optional_float(body, "power_kw"),
+            owner=str(body.get("owner", "")),
+            note=str(body.get("note", "")),
+        )
+
+    def _schedule_maintenance(self, params: dict, body: dict) -> dict:
+        rack_id = str(body.get("rack_id", "")).strip()
+        if not rack_id:
+            raise StoreError("rack_id 不能为空", component="console")
+        return self._platform.add_maintenance_window(
+            rack_id,
+            _as_float(body, "start", 0.0),
+            _as_float(body, "end", 0.0),
+            reason=str(body.get("reason", "")),
+        )
+
+    def _schedule_curtailment(self, params: dict, body: dict) -> dict:
+        return self._platform.set_curtailment(
+            _as_int(body, "slot_index", 0),
+            import_kw=_as_optional_float(body, "import_kw"),
+            export_kw=_as_optional_float(body, "export_kw"),
+        )
+
+    def _schedule_reserve(self, params: dict, body: dict) -> dict:
+        keys = ("charge_reserve_ratio", "discharge_reserve_ratio", "charge_reserve_kw", "discharge_reserve_kw")
+        return self._platform.set_reserve(**{key: _as_float(body, key, float(body.get(key, 0.0))) for key in keys if key in body})
+
+    def _schedule_generate(self, params: dict, body: dict) -> dict:
+        plan_date = body.get("plan_date")
+        policy = body.get("policy")
+        return self._platform.generate_schedule(
+            str(plan_date) if plan_date else None,
+            policy=str(policy) if policy else None,
+            reason=str(body.get("reason", "")),
+        )
+
+    def _schedule_version(self, params: dict, body: dict) -> dict:
+        plan_date = str(params.get("plan_date", ""))
+        version = _as_int(params, "version", 0)
+        result = self._platform.schedule_version(plan_date, version)
+        return result if result is not None else {"error": "not_found", "plan_date": plan_date, "version": version}
+
+    def _schedule_replay(self, params: dict, body: dict) -> dict:
+        return {"replay": self._platform.replay_schedule(str(params.get("plan_date", "")))}
+
+    def _schedule_policy(self, params: dict, body: dict) -> dict:
+        plan_date = params.get("plan_date") or self._platform.clock_iso_date()
+        return self._platform.explain_schedule_policy(str(plan_date))
+
+    def _schedule_recompute(self, params: dict, body: dict) -> dict:
+        return self._platform.recompute_schedule(
+            str(params.get("plan_date", "")),
+            _as_int(params, "version", 0),
+        )
